@@ -482,6 +482,7 @@ class RepresentationTrainer(Trainer):
         self.gamma = kwargs.pop('gamma', 1.0)
         self.last_token = kwargs.pop('last_token', -2)
         self.debug = kwargs.pop('debug', 0)
+        self.additive_mask = kwargs.pop('additive_mask', False)
         super().__init__(*args, **kwargs)
     
     def _last_token_index(self, input_ids, labels, attention_mask):
@@ -511,23 +512,72 @@ class RepresentationTrainer(Trainer):
             print(index_tensor)
 
         return index_tensor
+    
+    def _build_additive_mask(self, k: int):
+        mask = torch.zeros((k, k), dtype=torch.float32)
+        mask[torch.triu(torch.ones(k, k), diagonal=1) == 1] = -torch.inf
+        return mask
+
+    def build_with_additive_mask(self, inputs):
+        batch_size = inputs["input_ids"].shape[0]
+        seq_length = inputs["input_ids"].shape[-1]
+        device = inputs["input_ids"].device
+        mask = torch.full((batch_size * 2, 1, seq_length, seq_length), -torch.inf).to(device)
+        last_token = self._last_token_index(inputs["input_ids"], inputs["labels"], inputs["attention_mask"])        
+        last_token_user = self._last_token_index(inputs["input_ids_user"], inputs["labels_user"], inputs["attention_mask_user"])
+        last_token_assistant = self._last_token_index(inputs["input_ids_assistant"], inputs["labels_assistant"], inputs["attention_mask_assistant"])
+        for i in range(inputs["input_ids_user"].shape[0]):
+            length, length_user, length_assistant = last_token[i] + 1, last_token_user[i] + 1, last_token_assistant[i] + 1
+            inputs["input_ids_user"][i, length_user:length_user + length_assistant] = inputs["input_ids_assistant"][i, :length_assistant]
+            inputs["labels_user"][i, length_user:length_user + length_assistant] = inputs["labels_assistant"][i, :length_assistant]
+            mask[i, :, 0:length, 0:length] = self._build_additive_mask(length)
+            mask[i + batch_size, :, 0:length_user, 0:length_user] = self._build_additive_mask(length_user)
+            mask[i + batch_size, :, length_user:length_user + length_assistant, length_user:length_user + length_assistant] = self._build_additive_mask(length_assistant)
+        self._last_token_user = last_token_user
+        self._last_token_assistant = last_token_assistant + last_token_user + 1
+        return {
+                "input_ids": torch.cat([inputs["input_ids"],
+                                        inputs["input_ids_user"]], dim=0),
+                "labels": torch.cat([inputs["labels"],
+                                    inputs["labels_user"]], dim=0),
+                "attention_mask": mask,
+            }
 
     def forward(self, model, inputs):
         """
         Custom forward pass that handles all model calls.
         """
         # Main forward pass for language modeling
-        llm_inputs = {
-            "input_ids": torch.cat([inputs["input_ids"],
-                                    inputs["input_ids_user"],
-                                    inputs["input_ids_assistant"]], dim=0),
-            "labels": torch.cat([inputs["labels"],
-                                 inputs["labels_user"],
-                                 inputs["labels_assistant"]], dim=0),
-            "attention_mask": torch.cat([inputs["attention_mask"],
-                                         inputs["attention_mask_user"],
-                                         inputs["attention_mask_assistant"]], dim=0),
-        }
+        if self.additive_mask:
+            llm_inputs = self.build_with_additive_mask(inputs)
+        else:
+            llm_inputs = {
+                "input_ids": torch.cat([inputs["input_ids"],
+                                        inputs["input_ids_user"],
+                                        inputs["input_ids_assistant"]], dim=0),
+                "labels": torch.cat([inputs["labels"],
+                                    inputs["labels_user"],
+                                    inputs["labels_assistant"]], dim=0),
+                "attention_mask": torch.cat([inputs["attention_mask"],
+                                            inputs["attention_mask_user"],
+                                            inputs["attention_mask_assistant"]], dim=0),
+            }
+        if self.debug == 7 and torch.cuda.current_device() == 0:
+            torch.set_printoptions(threshold=float("inf"))
+            torch.set_printoptions(linewidth=360)
+            print(">>>input_ids<<<")
+            print(llm_inputs["input_ids"])
+            print(">>>labels<<<")
+            print(llm_inputs["labels"])
+            print(">>>attention_mask<<<")
+            print(llm_inputs["attention_mask"])
+            if self.additive_mask:
+                print(">>>last_token_user<<<")
+                print(self._last_token_user)
+                print(">>>last_token_assistant<<<")
+                print(self._last_token_assistant)
+        if self.debug == 7:
+            exit(0)
         if self.debug == 2 and torch.cuda.current_device() == 0:
             print("=====before:outputs=====")
             print("input_ids shapes:")
@@ -544,9 +594,14 @@ class RepresentationTrainer(Trainer):
             print(f"=====outputs.loss.shape:{outputs.loss.shape}=====")
             print(f"=====outputs.hidden_states[-1].shape:{outputs.hidden_states[-1].shape}=====")
         
-        batch_size = llm_inputs["input_ids"].shape[0] // 3
-        user_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2]
-        assistant_hidden_states = outputs.hidden_states[-1][batch_size * 2:]
+        if self.additive_mask:
+            batch_size = llm_inputs["input_ids"].shape[0] // 2
+            user_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2]
+            assistant_hidden_states = user_hidden_states
+        else:
+            batch_size = llm_inputs["input_ids"].shape[0] // 3
+            user_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2]
+            assistant_hidden_states = outputs.hidden_states[-1][batch_size * 2:]
 
         if self.debug == 2 and torch.cuda.current_device() == 0:
             print(f"====={user_hidden_states.shape}=====")
@@ -564,8 +619,9 @@ class RepresentationTrainer(Trainer):
         Compute loss with additional regularization terms.
         """
         # Get indeices
-        index_user = self._last_token_index(inputs["input_ids_user"], inputs["labels_user"], inputs["attention_mask_user"])
-        index_assistant = self._last_token_index(inputs["input_ids_assistant"], inputs["labels_assistant"], inputs["attention_mask_assistant"])
+        if not self.additive_mask:
+            index_user = self._last_token_index(inputs["input_ids_user"], inputs["labels_user"], inputs["attention_mask_user"])
+            index_assistant = self._last_token_index(inputs["input_ids_assistant"], inputs["labels_assistant"], inputs["attention_mask_assistant"])
         first_dim = inputs["input_ids_user"].shape[0]
         if self.debug == 1 and torch.cuda.current_device() == 0:
             print("=====last tokens=====")
@@ -576,6 +632,9 @@ class RepresentationTrainer(Trainer):
 
         # Get all forward pass results
         forward_results = self.forward(model, inputs)
+        if self.additive_mask:
+            index_user = self._last_token_user
+            index_assistant = self._last_token_assistant
         
         # Extract main language modeling loss
         main_outputs = forward_results['main_outputs']
@@ -666,6 +725,7 @@ def main():
     parser.add_argument("--pretrain", action="store_true", help="Whether to pretrain from scratch.")
     parser.add_argument("--train_all", action="store_true", help="Whether to compute loss from all tokens.")
     parser.add_argument("--plain", action="store_true", help="When set, do not apply chat format. If --train_all is not set, use `<|perceptioin|>` to connect query and answer. If --train_all is set, only train query.")
+    parser.add_argument("--additive_mask", action="store_true", help="When set, Use an additive mask to compute both user and assistant in 1 forward pass.")
 
     args = parser.parse_args()
     
@@ -860,6 +920,7 @@ def main():
             gamma=args.gamma,
             last_token=args.last_token,
             debug=args.debug,
+            additive_mask=args.additive_mask,
         )
     
     if torch.cuda.current_device() == 0 and args.lora:

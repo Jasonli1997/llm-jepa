@@ -12,6 +12,8 @@ The fine-tuning script is in `finetune.py`. A convenient driver script, `run.sh`
 
 For all experiments, we fix number of epochs to 4. The `last_token` setting depends on the model family; see the commented lines in `run.sh` for how to set it. Each configuration is run with 5 random seeds. We report mean accuracy and standard deviation.
 
+The original implementation required two additional forward passes to encode `Text` and `Code` separately. The latest version combines them into a single forward pass using a 4D additive attention mask. Enable this feature with `--additive_mask`.
+
 ## Large models
 
 Similarly, we provide `finetune8bh200.py` and `run8bh200.sh` for training modesl up to 8B parameters on NVIDIA H200 GPUs.
