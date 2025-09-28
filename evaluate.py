@@ -1,8 +1,4 @@
-#!/usr/bin/env python3
-"""
-Run inference on a pretrained model to generate assistant responses for a dataset.
-Supports both local models and Hugging Face models with various generation strategies.
-Now includes train/test splitting functionality.
+"""Evaluation for LLM-JEPA.
 """
 
 import copy
@@ -424,6 +420,37 @@ def split_dataset_and_save(input_file, train_file, test_file, test_size=0.2, see
     return train_file, test_file
 
 
+def relative_probability(model, tokenizer, prompt, max_length):
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+    )
+    
+    # Move to model device
+    if hasattr(model, 'device'):
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    else:
+        # For multi-device setups, let the model handle device placement
+        pass
+    
+    # Get hidden states
+    with torch.no_grad():
+        outputs = model(**inputs)
+    
+    logits = outputs.logits
+    next_token_logits = logits[0, -1]
+    token_A_id = tokenizer.convert_tokens_to_ids("A")
+    token_B_id = tokenizer.convert_tokens_to_ids("B")
+    token_C_id = tokenizer.convert_tokens_to_ids("C")
+    token_D_id = tokenizer.convert_tokens_to_ids("D")
+    probs = torch.softmax(next_token_logits, dim=-1)
+    probs_tensor = torch.tensor([probs[token_A_id].item(), probs[token_B_id].item(), probs[token_C_id].item(), probs[token_D_id].item()])
+    answers = ["A", "B", "C", "D"]
+    return answers[torch.argmax(probs_tensor)]
+
+
 spider_pattern = re.compile(r"For db_id:\[(.+)\]")
 
 
@@ -474,6 +501,13 @@ def eval(generated, ground_truth, input_file, spider_path, startswith=False, deb
 
     if input_file.startswith("spider"):
         return spider_eval(generated, ground_truth, spider_path, debug=debug)
+    
+    if input_file.startswith("nq_open"):
+        answer_list = generated.split("; ")
+        for answer in answer_list:
+            if answer in ground_truth[2]["content"]:
+                return True
+        return False
 
     if debug == 1:
         print("[GEN]", generated)
@@ -486,7 +520,7 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
                     generation_config, spider_path, max_examples=None, skip_existing=True,
                     split_tune_untune=False, start_index=1, layer=-1, pooling="last",
                     debug=0, similarity=False, startswith=False, max_new_tokens=128, t_sne=False,
-                    plain=False, t_sne_type=None):
+                    plain=False, t_sne_type=None, model_name=None):
     """Process dataset and generate responses"""
     
     # Load dataset
@@ -583,7 +617,15 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
                 if split_tune_untune:
                     full_messages = get_messages(original_model_name, messages)
                     prompt = format_conversation(full_messages, tokenizer, plain=plain)
-                    generated_response = generate_response(model, tokenizer, prompt, generation_config, max_new_tokens)
+                    if input_file.startswith("hellaswag"):
+                        generated_response = relative_probability(model, tokenizer, prompt, max_length=generation_config.max_new_tokens)
+                        if debug == 6:
+                            print(f"<<< {prompt}")
+                            print(f"=== {messages[2]['content']}")
+                            print(f">>> {generated_response}")
+                            exit(0)
+                    else:
+                        generated_response = generate_response(model, tokenizer, prompt, generation_config, max_new_tokens)
                     # if generated_response == messages[2]["content"]:
                     # equal = (generated_response == messages[2]["content"])
                     # if startswith:
@@ -612,7 +654,7 @@ def process_dataset(input_file, output_file, original_model_name, model, tokeniz
         with open ('tsne.pkl', 'wb') as f:
             pickle.dump(data, f)
 
-    print(f"Success Rate: {len(sim_list) / (len(sim_list) + len(sim_list_untune))}", end="")
+    print(f"Success Rate: {model_name}, {len(sim_list) / (len(sim_list) + len(sim_list_untune))}", end="")
     if startswith:
         print(f", {len(sim_list_startswith) / (len(sim_list) + len(sim_list_untune))}")
     else:
@@ -806,6 +848,7 @@ def main():
             t_sne=args.t_sne,
             t_sne_type=args.t_sne_type,
             plain=args.plain,
+            model_name=args.model_name,
         )
         
         all_results[split_name] = results

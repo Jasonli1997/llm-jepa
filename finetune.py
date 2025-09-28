@@ -1,10 +1,8 @@
-#!/usr/bin/env python3
-"""
-Fine-tune Gemma-3-1B model with system/user/assistant message format.
-Supports both single GPU and multi-GPU training via torchrun.
+"""LLM-JEPA.
 """
 
 import copy
+import math
 import os
 # import re
 import time
@@ -62,7 +60,7 @@ def get_assistant_messages(model_name, dataset, messages):
 
 def load_and_prepare_dataset(data_file, tokenizer, model_name,
                              max_length=2048, debug=0, predictors=0, regular=False, train_all=False,
-                             plain=False):
+                             plain=False, front_pred=False, reverse_pred=False):
     """Load JSONL dataset and format for training with proper label masking"""
     
     # Load dataset
@@ -82,7 +80,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
         assistant_labels_list = []
         assistant_attention_mask_list = []
 
-        for messages in examples['messages']:
+        for msg_idx, messages in enumerate(examples['messages']):
             # Apply chat template if available, otherwise format manually
             full_messages = get_messages(model_name, messages)
             if plain:
@@ -119,10 +117,22 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             labels_list.append(labels)
             attention_mask_list.append(attention_mask)
 
-            user_messages = get_user_messages(model_name, messages)
+            if data_file.startswith("hellaswag"):
+                user_messages = examples["text"][msg_idx]
+                if debug == 8:
+                    print(json.dumps(messages, indent=2))
+                    print(json.dumps(user_messages, indent=2))
+            else:
+                if reverse_pred:
+                    user_messages = get_assistant_messages(model_name, data_file, messages)
+                else:
+                    user_messages = get_user_messages(model_name, messages)
             to_add = predictors
             while to_add > 0:
-                user_messages[0]["content"] += f"<|predictor_{to_add}|>"
+                if front_pred:
+                    user_messages[0]["content"] = f"<|predictor_{to_add}|>" + user_messages[0]["content"]
+                else:
+                    user_messages[0]["content"] += f"<|predictor_{to_add}|>"
                 to_add -= 1
             if plain:
                 formatted_chat_user = user_messages[0]["content"]
@@ -143,7 +153,16 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             user_labels_list.append([-100] * len(tokenized_user["input_ids"]))
             user_attention_mask_list.append(tokenized_user["attention_mask"])
 
-            assistant_messages = get_assistant_messages(model_name, data_file, messages)
+            if data_file.startswith("hellaswag"):
+                assistant_messages = examples["code"][msg_idx]
+                if debug == 8:
+                    print(json.dumps(assistant_messages, indent=2))
+                    exit(0)
+            else:
+                if reverse_pred:
+                    assistant_messages = get_user_messages(model_name, messages)
+                else:
+                    assistant_messages = get_assistant_messages(model_name, data_file, messages)
             if plain:
                 formatted_chat_assistant = assistant_messages[0]["content"]
             else:
@@ -382,6 +401,7 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
         tokenizer.chat_template = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+        assert tokenizer.chat_template is not None, f"{model_name} does not have chat template."
     
     # use_llama_3_2_chat_template(tokenizer)
     
@@ -483,6 +503,11 @@ class RepresentationTrainer(Trainer):
         self.last_token = kwargs.pop('last_token', -2)
         self.debug = kwargs.pop('debug', 0)
         self.additive_mask = kwargs.pop('additive_mask', False)
+        self.jepa_l2 = kwargs.pop('jepa_l2', False)
+        self.jepa_mse = kwargs.pop('jepa_mse', False)
+        self.infonce = kwargs.pop('infonce', False)
+        self.jepa_ratio = kwargs.pop('jepa_ratio', -1.0)
+        assert self.jepa_l2 + self.jepa_mse <= 1, "Only one of jepa_l2 and jepa_mse can be True."
         super().__init__(*args, **kwargs)
     
     def _last_token_index(self, input_ids, labels, attention_mask):
@@ -519,6 +544,13 @@ class RepresentationTrainer(Trainer):
         return mask
 
     def build_with_additive_mask(self, inputs):
+        if self.jepa_ratio > 0.0:
+            if torch.rand(1).item() > self.jepa_ratio:
+                return {
+                    "input_ids": inputs["input_ids"],
+                    "labels": inputs["labels"],
+                    "attention_mask": inputs["attention_mask"],
+                }, True
         batch_size = inputs["input_ids"].shape[0]
         seq_length = inputs["input_ids"].shape[-1]
         device = inputs["input_ids"].device
@@ -541,7 +573,7 @@ class RepresentationTrainer(Trainer):
                 "labels": torch.cat([inputs["labels"],
                                     inputs["labels_user"]], dim=0),
                 "attention_mask": mask,
-            }
+            }, False
 
     def forward(self, model, inputs):
         """
@@ -549,7 +581,7 @@ class RepresentationTrainer(Trainer):
         """
         # Main forward pass for language modeling
         if self.additive_mask:
-            llm_inputs = self.build_with_additive_mask(inputs)
+            llm_inputs, skip_jepa = self.build_with_additive_mask(inputs)
         else:
             llm_inputs = {
                 "input_ids": torch.cat([inputs["input_ids"],
@@ -595,9 +627,13 @@ class RepresentationTrainer(Trainer):
             print(f"=====outputs.hidden_states[-1].shape:{outputs.hidden_states[-1].shape}=====")
         
         if self.additive_mask:
-            batch_size = llm_inputs["input_ids"].shape[0] // 2
-            user_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2]
-            assistant_hidden_states = user_hidden_states
+            if skip_jepa:
+                user_hidden_states = None
+                assistant_hidden_states = None
+            else:    
+                batch_size = llm_inputs["input_ids"].shape[0] // 2
+                user_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2]
+                assistant_hidden_states = user_hidden_states
         else:
             batch_size = llm_inputs["input_ids"].shape[0] // 3
             user_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2]
@@ -632,9 +668,6 @@ class RepresentationTrainer(Trainer):
 
         # Get all forward pass results
         forward_results = self.forward(model, inputs)
-        if self.additive_mask:
-            index_user = self._last_token_user
-            index_assistant = self._last_token_assistant
         
         # Extract main language modeling loss
         main_outputs = forward_results['main_outputs']
@@ -645,17 +678,39 @@ class RepresentationTrainer(Trainer):
         assistant_hidden_states = forward_results['assistant_hidden_states']
         
         # Get embeddings (using last token of each sequence)
-        user_embedding = user_hidden_states[range(first_dim), index_user, :]
-        assistant_embedding = assistant_hidden_states[range(first_dim), index_assistant, :]
-        
-        # Compute cosine similarity
-        cosine_similarity = F.cosine_similarity(user_embedding, assistant_embedding, dim=-1)
-        if self.debug == 1 and torch.cuda.current_device() == 0:
-            print(user_embedding.shape, assistant_embedding.shape)
-            print(cosine_similarity.shape)
- 
-        # Compute total loss
-        jepa_loss = 1.0 - torch.mean(cosine_similarity)
+        if user_hidden_states is not None:
+            if self.additive_mask:
+                index_user = self._last_token_user
+                index_assistant = self._last_token_assistant
+            user_embedding = user_hidden_states[range(first_dim), index_user, :]
+            assistant_embedding = assistant_hidden_states[range(first_dim), index_assistant, :]
+            
+            # Compute cosine similarity
+            cosine_similarity = F.cosine_similarity(user_embedding, assistant_embedding, dim=-1)
+            if self.debug == 1 and torch.cuda.current_device() == 0:
+                print(user_embedding.shape, assistant_embedding.shape)
+                print(cosine_similarity.shape)
+    
+            # Compute total loss
+            if self.jepa_l2:
+                jepa_loss = torch.linalg.norm(user_embedding - assistant_embedding, ord=2, dim=-1).mean()
+            elif self.jepa_mse:
+                jepa_loss = torch.mean((user_embedding - assistant_embedding) ** 2)
+            elif self.infonce:
+                ue_norm = F.normalize(user_embedding, p=2, dim=1)
+                ae_norm = F.normalize(assistant_embedding, p=2, dim=1)
+                cosine_sim = torch.mm(ue_norm, ae_norm.T)
+                infonce_logit = cosine_sim / 0.07  # temperature
+                infonce_label = torch.arange(cosine_sim.size(0), device=cosine_sim.device)
+                jepa_loss = F.cross_entropy(infonce_logit, infonce_label)
+                if self.debug == 8:
+                    print(cosine_sim.shape, infonce_logit.shape, infonce_label.shape, jepa_loss.shape)
+                    exit(0)
+            else:
+                jepa_loss = 1.0 - torch.mean(cosine_similarity)
+        else:
+            jepa_loss = 0.0
+
         total_loss = self.gamma * lm_loss + self.lbd * jepa_loss
 
         if self.debug == 2 and torch.cuda.current_device() == 0:
@@ -693,7 +748,7 @@ class ProfilerFLOPCallback(TrainerCallback):
             step_flops = sum(event.flops for event in events if event.flops > 0)
             self.total_flops += step_flops
             
-            if torch.cuda.current_device() == 0 and state.global_step == 1:
+            if torch.cuda.current_device() == 0:  # and (state.global_step == 63 or state.global_step % 10 == 0):
                 print(f"Step {state.global_step}: FLOPs: {step_flops:,.0f}")
 
 
@@ -726,6 +781,13 @@ def main():
     parser.add_argument("--train_all", action="store_true", help="Whether to compute loss from all tokens.")
     parser.add_argument("--plain", action="store_true", help="When set, do not apply chat format. If --train_all is not set, use `<|perceptioin|>` to connect query and answer. If --train_all is set, only train query.")
     parser.add_argument("--additive_mask", action="store_true", help="When set, Use an additive mask to compute both user and assistant in 1 forward pass.")
+    parser.add_argument("--jepa_l2", action="store_true", help="When set, Use l2 norm as JEPA loss.")
+    parser.add_argument("--jepa_mse", action="store_true", help="When set, Use Mean Squared Error as JEPA loss.")
+    parser.add_argument("--front_pred", action="store_true", help="When set, Put [Pred] token at the beginning of `Text`.")
+    parser.add_argument("--reverse_pred", action="store_true", help="When set, Use `Code` to predict `Text`.")
+    parser.add_argument("--infonce", action="store_true", help="When set, Use InfoNCE loss.")
+    parser.add_argument("--same_flop", action="store_true", help="When set, Use same number of flops per epoch.")
+    parser.add_argument("--jepa_ratio", type=float, default=-1.0, help="When >0, randomly select this ratio of batches to apply JEPA. This implments Random JEPA-Loss Dropout (LD). If LD = alpha, jepa_ratio = 1 - alpha")
 
     args = parser.parse_args()
     
@@ -783,7 +845,8 @@ def main():
         train_dataset = load_and_prepare_dataset(
             args.train_file, tokenizer, args.model_name,
             args.max_length, predictors=args.predictors, regular=args.regular,
-            debug=args.debug, train_all=args.train_all, plain=args.plain)
+            debug=args.debug, train_all=args.train_all, plain=args.plain,
+            front_pred=args.front_pred, reverse_pred=args.reverse_pred)
         
         if args.eval_file:
             if torch.cuda.current_device() == 0:
@@ -791,7 +854,8 @@ def main():
             eval_dataset = load_and_prepare_dataset(
                 args.eval_file, tokenizer, args.model_name,
                 args.max_length, regular=args.regular,
-                debug=args.debug, train_all=args.train_all, plain=args.plain)
+                debug=args.debug, train_all=args.train_all, plain=args.plain,
+                front_pred=args.front_pred, reverse_pred=args.reverse_pred)
         else:
             eval_dataset = None
             if torch.cuda.current_device() == 0:
@@ -804,7 +868,8 @@ def main():
         full_dataset = load_and_prepare_dataset(
             args.data_file, tokenizer, args.model_name,
             args.max_length, predictors=args.predictors, regular=args.regular,
-            debug=args.debug, train_all=args.train_all, plain=args.plain)
+            debug=args.debug, train_all=args.train_all, plain=args.plain,
+            front_pred=args.front_pred, reverse_pred=args.reverse_pred)
 
         if args.eval_split > 0:
             split_dataset = full_dataset.train_test_split(
@@ -835,7 +900,23 @@ def main():
     
     # Training arguments - optimized for multi-GPU stability
     eval_steps = args.eval_steps if not args.pretrain else args.eval_steps * 20
+    save_steps = len(train_dataset) // (world_size * args.batch_size * args.grad_accum)
+    if args.same_flop:
+        if args.jepa_ratio > 0.0:
+            save_steps = int(save_steps / (1 + args.jepa_ratio))
+            args.num_epochs = int(math.ceil(args.num_epochs / (1 + args.jepa_ratio)))
+        elif args.additive_mask:
+            save_steps = save_steps // 2
+            args.num_epochs = int(math.ceil(args.num_epochs / 2))
+        elif not args.regular:
+            save_steps = save_steps // 3
+            args.num_epochs = int(math.ceil(args.num_epochs / 3))
+        if torch.cuda.current_device() == 0:
+            print(f">>>>> --same_flop is active: Save checkpoint every: {save_steps} steps, run {args.num_epochs} epochs")
     output_dir = os.path.abspath(args.output_dir)
+    if torch.cuda.current_device() == 0:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        os.makedirs(output_dir, exist_ok=True)
     training_args = TrainingArguments(
         output_dir=output_dir,
         overwrite_output_dir=True,
@@ -848,13 +929,13 @@ def main():
         num_train_epochs=args.num_epochs,
         
         # Evaluation
-        eval_strategy="steps" if eval_dataset else "no",
-        eval_steps=eval_steps,
+        eval_strategy="no",  # "steps" if eval_dataset else "no",
+        # eval_steps=eval_steps,
         
         # Saving
         save_strategy="steps",
-        save_steps=eval_steps,
-        save_total_limit=2,
+        save_steps=save_steps,
+        save_total_limit=args.num_epochs * 4,
 
         # Logging
         logging_dir=f"{args.output_dir}/logs",
@@ -921,6 +1002,10 @@ def main():
             last_token=args.last_token,
             debug=args.debug,
             additive_mask=args.additive_mask,
+            jepa_l2=args.jepa_l2,
+            jepa_mse=args.jepa_mse,
+            infonce=args.infonce,
+            jepa_ratio=args.jepa_ratio,
         )
     
     if torch.cuda.current_device() == 0 and args.lora:
@@ -955,8 +1040,6 @@ def main():
         print("\n5. Saving final model...")
 
     def save_model(model):
-        shutil.rmtree(output_dir, ignore_errors=True)
-        os.makedirs(output_dir, exist_ok=True)
         if torch.cuda.current_device() == 0:
             if args.lora:
                 model = model.merge_and_unload()
