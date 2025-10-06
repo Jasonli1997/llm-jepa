@@ -26,6 +26,13 @@ from peft import LoraConfig, get_peft_model, TaskType
 import argparse
 
 
+def is_main_process():
+    if torch.cuda.is_available():
+        return torch.cuda.current_device() == 0
+    
+    return True
+
+
 def get_messages(model_name, messages):
     if "google/gemma" in model_name:
         full_messages = copy.deepcopy(messages)[1:3]
@@ -65,7 +72,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
     
     # Load dataset
     dataset = load_dataset('json', data_files=data_file)['train']
-    if  torch.cuda.current_device() == 0:
+    if is_main_process():
         print(f"Loaded {len(dataset)} examples from {data_file}")
     
     def tokenize_conversations(examples):
@@ -182,7 +189,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             assistant_labels_list.append([-100] * len(tokenized_assistant["input_ids"]))
             assistant_attention_mask_list.append(tokenized_assistant["attention_mask"])
 
-            if debug == 3 and torch.cuda.current_device() == 0:
+            if debug == 3 and is_main_process():
                 print(messages)
                 print(input_ids_list)
                 print(tokenizer.decode(input_ids_list[0]))
@@ -267,7 +274,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 decoded_input = [tokenizer.decode(item) for item in input_ids]
                 for i in range(len(input_ids) - len(assistant_tokens) + 1):
                     # Only check non-padding tokens
-                    if debug == 4 and torch.cuda.current_device() == 0:
+                    if debug == 4 and is_main_process():
                         print(f"=======input_ids: {input_ids[i:i+len(assistant_tokens)]}")
                         print(f"assistant_tokens: {assistant_tokens}")
                     # if attention_mask[i] == 1 and input_ids[i:i+len(assistant_tokens)] == assistant_tokens:
@@ -392,7 +399,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
 #         tokenizer.chat_template = llama_3_2_chat_template
 
 
-def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=False, debug=0, seed=None):
+def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=False, debug=0, seed=None, use_eager_attn=False):
     """Setup model and tokenizer with optional LoRA"""
     
     # Load tokenizer
@@ -408,7 +415,7 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
     # Add special tokens if not present
     if "microsoft/phi" in model_name:
         tokenizer.add_special_tokens({"bos_token": "<|startoftext|>"})
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             print("Added <|startoftext|> token")
 
     special_tokens = ["<|predictor_1|>", "<|predictor_2|>", "<|predictor_3|>", "<|predictor_4|>", "<|predictor_5|>",
@@ -418,7 +425,7 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
     
     if new_tokens:
         tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             print(f"Added {len(new_tokens)} new special tokens")
     
     # Set pad token
@@ -434,6 +441,9 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
         else:
             # For multi-GPU with torchrun, don't use device_map
             device_map = None
+    
+    elif torch.backends.mps.is_available():
+        device_map = "mps"
     
     if pretrain:
         if seed is not None:
@@ -458,12 +468,13 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map=device_map,
             trust_remote_code=True,
             # Add these for better multi-GPU stability
             low_cpu_mem_usage=True,
             use_cache=False,  # Disable KV cache for training
+            attn_implementation="eager" if use_eager_attn else "sdpa",
         )
 
     if new_tokens:
@@ -485,7 +496,7 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
         )
         model = get_peft_model(model, lora_config)
         model.enable_input_require_grads()
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             model.print_trainable_parameters()
     
     return model, tokenizer
@@ -525,7 +536,7 @@ class RepresentationTrainer(Trainer):
 
         for i in range(input_ids.shape[0]):
             uii = unpad(input_ids[i], attention_mask[i])
-            if self.debug == 1 and torch.cuda.current_device() == 0:
+            if self.debug == 1 and is_main_process():
                 print(f"====={len(uii)}=====")
                 print(input_ids[i][len(uii) - 4], input_ids[i][len(uii) - 3], input_ids[i][len(uii) - 2], input_ids[i][len(uii) - 1], -100 if len(uii) >= len(input_ids[i]) else input_ids[i][len(uii)])
                 print(labels[i][len(uii) - 4], labels[i][len(uii) - 3], labels[i][len(uii) - 2], labels[i][len(uii) - 1], -100 if len(uii) >= len(labels[i]) else labels[i][len(uii)])
@@ -533,7 +544,7 @@ class RepresentationTrainer(Trainer):
             index.append(len(uii) + self.last_token)
         
         index_tensor = torch.tensor(index).to(input_ids.device)
-        if self.debug == 1 and torch.cuda.current_device() == 0:
+        if self.debug == 1 and is_main_process():
             print(index_tensor)
 
         return index_tensor
@@ -594,7 +605,7 @@ class RepresentationTrainer(Trainer):
                                             inputs["attention_mask_user"],
                                             inputs["attention_mask_assistant"]], dim=0),
             }
-        if self.debug == 7 and torch.cuda.current_device() == 0:
+        if self.debug == 7 and is_main_process():
             torch.set_printoptions(threshold=float("inf"))
             torch.set_printoptions(linewidth=360)
             print(">>>input_ids<<<")
@@ -610,7 +621,7 @@ class RepresentationTrainer(Trainer):
                 print(self._last_token_assistant)
         if self.debug == 7:
             exit(0)
-        if self.debug == 2 and torch.cuda.current_device() == 0:
+        if self.debug == 2 and is_main_process():
             print("=====before:outputs=====")
             print("input_ids shapes:")
             print(llm_inputs["input_ids"].shape)
@@ -622,7 +633,7 @@ class RepresentationTrainer(Trainer):
         with torch.set_grad_enabled(True):
             outputs = model(**llm_inputs, output_hidden_states=True)
 
-        if self.debug == 2 and torch.cuda.current_device() == 0:
+        if self.debug == 2 and is_main_process():
             print(f"=====outputs.loss.shape:{outputs.loss.shape}=====")
             print(f"=====outputs.hidden_states[-1].shape:{outputs.hidden_states[-1].shape}=====")
         
@@ -636,10 +647,11 @@ class RepresentationTrainer(Trainer):
                 assistant_hidden_states = user_hidden_states
         else:
             batch_size = llm_inputs["input_ids"].shape[0] // 3
+            # Get hidden states from the last transformer layer 
             user_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2]
             assistant_hidden_states = outputs.hidden_states[-1][batch_size * 2:]
 
-        if self.debug == 2 and torch.cuda.current_device() == 0:
+        if self.debug == 2 and is_main_process():
             print(f"====={user_hidden_states.shape}=====")
             print(f"====={assistant_hidden_states.shape}=====")
        
@@ -659,7 +671,7 @@ class RepresentationTrainer(Trainer):
             index_user = self._last_token_index(inputs["input_ids_user"], inputs["labels_user"], inputs["attention_mask_user"])
             index_assistant = self._last_token_index(inputs["input_ids_assistant"], inputs["labels_assistant"], inputs["attention_mask_assistant"])
         first_dim = inputs["input_ids_user"].shape[0]
-        if self.debug == 1 and torch.cuda.current_device() == 0:
+        if self.debug == 1 and is_main_process():
             print("=====last tokens=====")
             print(inputs["input_ids_user"][range(first_dim), index_user])
             print(inputs["input_ids_user"][range(first_dim), index_user - 1])
@@ -687,7 +699,7 @@ class RepresentationTrainer(Trainer):
             
             # Compute cosine similarity
             cosine_similarity = F.cosine_similarity(user_embedding, assistant_embedding, dim=-1)
-            if self.debug == 1 and torch.cuda.current_device() == 0:
+            if self.debug == 1 and is_main_process():
                 print(user_embedding.shape, assistant_embedding.shape)
                 print(cosine_similarity.shape)
     
@@ -713,13 +725,13 @@ class RepresentationTrainer(Trainer):
 
         total_loss = self.gamma * lm_loss + self.lbd * jepa_loss
 
-        if self.debug == 2 and torch.cuda.current_device() == 0:
+        if self.debug == 2 and is_main_process():
             print(lm_loss, self.lbd, torch.mean(cosine_similarity))
 
         if self.debug == 1 or self.debug == 2:
             exit(0)
 
-        if self.debug == 5 and torch.cuda.current_device() == 0:
+        if self.debug == 5 and is_main_process():
             print(f"llm_loss: {lm_loss.float()}, jepa_loss: {jepa_loss.float()}")
 
         return (total_loss, main_outputs) if return_outputs else total_loss
@@ -748,7 +760,7 @@ class ProfilerFLOPCallback(TrainerCallback):
             step_flops = sum(event.flops for event in events if event.flops > 0)
             self.total_flops += step_flops
             
-            if torch.cuda.current_device() == 0:  # and (state.global_step == 63 or state.global_step % 10 == 0):
+            if is_main_process():  # and (state.global_step == 63 or state.global_step % 10 == 0):
                 print(f"Step {state.global_step}: FLOPs: {step_flops:,.0f}")
 
 
@@ -765,6 +777,7 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--eval_steps", type=int, default=10, help="Evaluation steps")
+    parser.add_argument("--use_eager_attn", action="store_true", help="Some models are recommended to use eager attn implementation rather than sdpa")
     parser.add_argument("--lora", action="store_true", help="Enable LoRA (default: full fine-tuning)")
     parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank. Default: 16.")
     parser.add_argument("--eval_split", type=float, default=0.2, help="Evaluation split ratio (if using single data file)")
@@ -798,10 +811,10 @@ def main():
     if args.train_file and args.data_file:
         parser.error("Cannot use both --train_file and --data_file. Choose one.")
     
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         print("=== Fine-tuning Script ===")
 
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         if args.train_file:
             print(f"Train file: {args.train_file}")
             if args.eval_file:
@@ -821,26 +834,26 @@ def main():
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     
     if world_size > 1:
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             print(f"Running with torchrun: world_size={world_size}, local_rank={local_rank}")
         # Initialize distributed training
         torch.distributed.init_process_group(backend='nccl')
         torch.cuda.set_device(local_rank)
     
     # Setup model and tokenizer
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         print("\n1. Loading model and tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(
         args.model_name, use_lora=args.lora, lora_rank=args.lora_rank, pretrain=args.pretrain,
-        debug=args.debug, seed=args.finetune_seed)
+        debug=args.debug, seed=args.finetune_seed, use_eager_attn=args.use_eager_attn)
     
     # Load and prepare dataset
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         print("\n2. Loading and preparing dataset...")
     
     if args.train_file:
         # Load separate train and eval files
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             print(f"Loading training data from {args.train_file}")
         train_dataset = load_and_prepare_dataset(
             args.train_file, tokenizer, args.model_name,
@@ -849,7 +862,7 @@ def main():
             front_pred=args.front_pred, reverse_pred=args.reverse_pred)
         
         if args.eval_file:
-            if torch.cuda.current_device() == 0:
+            if is_main_process():
                 print(f"Loading evaluation data from {args.eval_file}")
             eval_dataset = load_and_prepare_dataset(
                 args.eval_file, tokenizer, args.model_name,
@@ -858,12 +871,12 @@ def main():
                 front_pred=args.front_pred, reverse_pred=args.reverse_pred)
         else:
             eval_dataset = None
-            if torch.cuda.current_device() == 0:
+            if is_main_process():
                 print("No evaluation file provided")
     
     else:
         # Load single file and split
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             print(f"Loading data from {args.data_file} and splitting...")
         full_dataset = load_and_prepare_dataset(
             args.data_file, tokenizer, args.model_name,
@@ -884,7 +897,7 @@ def main():
             eval_dataset = None
     
     # Print dataset info
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         print(f"Train samples: {len(train_dataset)}")
         if eval_dataset:
             print(f"Eval samples: {len(eval_dataset)}")
@@ -911,10 +924,10 @@ def main():
         elif not args.regular:
             save_steps = save_steps // 3
             args.num_epochs = int(math.ceil(args.num_epochs / 3))
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             print(f">>>>> --same_flop is active: Save checkpoint every: {save_steps} steps, run {args.num_epochs} epochs")
     output_dir = os.path.abspath(args.output_dir)
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         shutil.rmtree(output_dir, ignore_errors=True)
         os.makedirs(output_dir, exist_ok=True)
     training_args = TrainingArguments(
@@ -975,7 +988,7 @@ def main():
 
     # Initialize trainer
     if args.regular:
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             print("\n3. Initializing regular trainer...")
         trainer = Trainer(
             model=model,
@@ -987,7 +1000,7 @@ def main():
             callbacks=[flop_callback] if args.track_flop else [],
         )
     else:
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             print("\n3. Initializing representation trainer...")
         trainer = RepresentationTrainer(
             model=model,
@@ -1008,7 +1021,7 @@ def main():
             jepa_ratio=args.jepa_ratio,
         )
     
-    if torch.cuda.current_device() == 0 and args.lora:
+    if is_main_process() and args.lora:
         print("=== PEFT Model Check ===")
         model.print_trainable_parameters()
 
@@ -1025,22 +1038,22 @@ def main():
             print("First few trainable params:", trainable_params[:5])
 
     # Start training
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         print("\n4. Starting training...")
     try:
         trainer.train()
     except Exception as e:
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             print(f"Training failed with error: {e}")
             print("This might be due to FSDP/sharding issues. Try running with --lora flag for LoRA fine-tuning.")
         raise
     
     # Save final model
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         print("\n5. Saving final model...")
 
     def save_model(model):
-        if torch.cuda.current_device() == 0:
+        if is_main_process():
             if args.lora:
                 model = model.merge_and_unload()
                 model.save_pretrained(output_dir)
@@ -1062,10 +1075,10 @@ def main():
                 raise
             time.sleep(10)
     
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         print(f"\n✅ Training completed! Model saved to {args.output_dir}")
     
-    if torch.cuda.current_device() == 0:
+    if is_main_process():
         print("\n🎉 Fine-tuning finished successfully!")
 
 
